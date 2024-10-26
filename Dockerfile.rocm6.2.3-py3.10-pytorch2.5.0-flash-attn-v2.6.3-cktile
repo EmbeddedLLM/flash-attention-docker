@@ -1,0 +1,86 @@
+# Default ROCm 6.2 base image
+ARG BASE_IMAGE="rocm/pytorch:rocm6.2.3_ubuntu22.04_py3.10_pytorch_release_2.3.0"
+
+# Default ROCm ARCHes to build vLLM for.
+# ARG PYTORCH_ROCM_ARCH="gfx908;gfx90a;gfx942;gfx1100"
+ARG PYTORCH_ROCM_ARCH="gfx942"
+
+# Whether to install CK-based flash-attention
+# If 0, will not install flash-attention
+ARG BUILD_FA="1"
+# ARG FA_GFX_ARCHS="gfx90a;gfx942"
+ARG FA_GFX_ARCHS="gfx942"
+ARG FA_BRANCH="v2.6.3-cktile"
+
+### Base image build stage
+FROM $BASE_IMAGE AS base
+
+# Import arg(s) defined before this build stage
+ARG PYTORCH_ROCM_ARCH
+ARG FA_GFX_ARCHS
+ARG FA_BRANCH
+
+# Install some basic utilities
+RUN apt-get update && apt-get install python3 python3-pip -y
+RUN apt-get update && apt-get install -y \
+    curl \
+    ca-certificates \
+    sudo \
+    git \
+    bzip2 \
+    libx11-6 \
+    build-essential \
+    wget \
+    unzip \
+    tmux \
+    ccache \
+ && rm -rf /var/lib/apt/lists/*
+
+# When launching the container, mount the code directory to /workspace
+ARG APP_MOUNT=/workspace
+WORKDIR ${APP_MOUNT}
+
+RUN python3 -m pip install --upgrade pip
+# Remove sccache so it doesn't interfere with ccache
+# TODO: implement sccache support across components
+RUN apt-get purge -y sccache; python3 -m pip uninstall -y sccache; rm -f "$(which sccache)"; python3 -m pip install ninja;
+
+# Install torch == 2.5.0 on ROCm
+RUN python3 -m pip uninstall -y torch torchvision \
+            && python3 -m pip install --pre \
+                torch==2.5.0 \
+                torchvision \
+                setuptools-scm>=8 \
+                torchaudio \
+                --extra-index-url https://download.pytorch.org/whl/rocm6.2
+
+ENV LLVM_SYMBOLIZER_PATH=/opt/rocm/llvm/bin/llvm-symbolizer
+ENV PATH=$PATH:/opt/rocm/bin:/libtorch/bin:
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/rocm/lib/:/libtorch/lib:
+ENV CPLUS_INCLUDE_PATH=$CPLUS_INCLUDE_PATH:/libtorch/include:/libtorch/include/torch/csrc/api/include/:/opt/rocm/include/:
+
+ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
+ENV CCACHE_DIR=/root/.cache/ccache
+ENV NINJA_JOBS=128
+
+### AMD-SMI build stage
+# FROM base AS build_amdsmi
+# Build amdsmi wheel always
+RUN cd /opt/rocm/share/amd_smi \
+    && python3 -m pip wheel . --wheel-dir=/install \
+    && python3 -m pip install /install/*.whl
+
+ENV MAX_JOBS=64
+
+RUN mkdir -p libs \
+        && cd libs \
+        && git clone https://github.com/ROCm/flash-attention.git \
+        && cd flash-attention \
+        && mkdir -p dist \
+        && git checkout "${FA_BRANCH}" \
+        && git submodule update --init \
+        && GPU_ARCHS="${FA_GFX_ARCHS}" python3 setup.py bdist_wheel --dist-dir=./dist;
+
+RUN ls && python3 -m pip install libs/flash-attention/dist/*.whl
+
+CMD ["/bin/bash"]
